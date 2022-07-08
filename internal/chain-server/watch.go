@@ -11,12 +11,11 @@ import (
 // 监听器
 type Watcher struct {
 	FilteredBlockChan <-chan *pb.InternalBlock
-	Exit              chan<- struct{}
 }
 
 // 监听链上的数据
 // WatchBlockEvent new watcher for block event.
-func (c *ChainClient) WatchBlockEvent(bcname string) (*Watcher, error) {
+func (c *ChainClient) WatchBlockEvent(ctx context.Context, bcname string) (*Watcher, error) {
 	// 创建监听器
 	watcher := &Watcher{}
 	// 区块过滤条件
@@ -37,10 +36,8 @@ func (c *ChainClient) WatchBlockEvent(bcname string) (*Watcher, error) {
 	}
 
 	// 创建管道，用于存放监听到的区块数据
-	// 管道大小
-	filteredBlockChan := make(chan *pb.InternalBlock, 100)
-	exit := make(chan struct{})
-	watcher.Exit = exit
+	// 管道大小 （3秒一个快）
+	filteredBlockChan := make(chan *pb.InternalBlock, 5)
 	watcher.FilteredBlockChan = filteredBlockChan
 
 	go func() {
@@ -54,7 +51,7 @@ func (c *ChainClient) WatchBlockEvent(bcname string) (*Watcher, error) {
 		}()
 		for {
 			select {
-			case <-exit:
+			case <-ctx.Done():
 				log.Println("[watch goroutine]---stop watch", bcname)
 				return
 			default:

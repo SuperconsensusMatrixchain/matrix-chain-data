@@ -1,17 +1,21 @@
 package scan_server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/wxnacy/wgo/arrays"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"log"
+	"math/big"
 	"matrixchaindata/global"
 	"matrixchaindata/pkg/utils"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // db 目前有4张表
@@ -34,8 +38,8 @@ type Count struct {
 	Contracts bson.A `bson:"contracts"`  //合约列表
 }
 
-// 写db结构体
-type WriteDB struct {
+// 解析器
+type Parser struct {
 	// mogodb的客户端
 	MongoClient *global.MongoClient
 	// 节点
@@ -44,28 +48,46 @@ type WriteDB struct {
 	Bcname string
 }
 
-// 新建一个写数据的实例
-func NewWriterDB(mongoclient *global.MongoClient, node, bcname string) *WriteDB {
-	return &WriteDB{
+// 新建一个解析器的实例
+func NewParser(mongoclient *global.MongoClient, node, bcname string) *Parser {
+	return &Parser{
 		MongoClient: mongoclient,
 		Node:        node,
 		Bcname:      bcname,
 	}
 }
 
-// 谨慎，目前传入的是全局的db连接
-func (w *WriteDB) Cloce() {
-	w.MongoClient.Close()
+func (p *Parser) Start(ctx context.Context, blockchan <-chan *utils.InternalBlock) error {
+	if blockchan != nil {
+		return errors.New("blockchan is nil")
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("stop parse")
+				return
+			case block, ok := <-blockchan:
+				if !ok {
+					return
+				} else {
+					_ = p.Save(block)
+				}
+			}
+		}
+
+	}()
+	return nil
 }
 
 // -----------------------------------------------------------------
 //					         写入数据库
 // -----------------------------------------------------------------
 // 保存区块数据信息
-func (w *WriteDB) Save(block *utils.InternalBlock, node, bcname string) error {
+func (p *Parser) Save(block *utils.InternalBlock) error {
 
 	// 多加一层判断，这个区块是否处理过了
-	if w.IsHandle(block.Height) {
+	if p.IsHandle(block.Height) {
 		log.Println("this block is handled", block.Height)
 		return fmt.Errorf("height is handled, countine")
 	}
@@ -73,7 +95,7 @@ func (w *WriteDB) Save(block *utils.InternalBlock, node, bcname string) error {
 	// 有一点需要注意的是block传过来的是指针，读数据就好了不要写。
 	go func() {
 		//存统计 （account, count表）
-		err := w.SaveCount(block)
+		err := p.SaveCount(block)
 		if err != nil {
 			log.Println(err)
 		}
@@ -81,7 +103,7 @@ func (w *WriteDB) Save(block *utils.InternalBlock, node, bcname string) error {
 
 	go func() {
 		//存交易 （tx表）
-		err := w.SaveTx(block)
+		err := p.SaveTx(block)
 		if err != nil {
 			log.Println(err)
 		}
@@ -89,7 +111,7 @@ func (w *WriteDB) Save(block *utils.InternalBlock, node, bcname string) error {
 
 	go func() {
 		//存区块 （block表）
-		err := w.SaveBlock(block)
+		err := p.SaveBlock(block)
 		if err != nil {
 			log.Println(err)
 		}
@@ -99,8 +121,8 @@ func (w *WriteDB) Save(block *utils.InternalBlock, node, bcname string) error {
 }
 
 // 这个区块的数据是否处理过
-func (w *WriteDB) IsHandle(block_height int64) bool {
-	blockCol := w.MongoClient.Database.Collection(utils.BlockCol(w.Node, w.Bcname))
+func (p *Parser) IsHandle(block_height int64) bool {
+	blockCol := p.MongoClient.Database.Collection(utils.BlockCol(p.Node, p.Bcname))
 	data := blockCol.FindOne(nil, bson.D{{"_id", block_height}})
 	if data.Err() != nil {
 		// 没有记录,则没有处理过
@@ -110,14 +132,14 @@ func (w *WriteDB) IsHandle(block_height int64) bool {
 }
 
 // 保存统计数据
-func (w *WriteDB) SaveCount(block *utils.InternalBlock) error {
+func (p *Parser) SaveCount(block *utils.InternalBlock) error {
 	locker.Lock()
 	defer locker.Unlock()
 
 	// 总数统计集合
-	countCol := w.MongoClient.Database.Collection(utils.CountCol(w.Node, w.Bcname))
+	countCol := p.MongoClient.Database.Collection(utils.CountCol(p.Node, p.Bcname))
 	// 账号统计集合
-	accCol := w.MongoClient.Database.Collection(utils.AccountCol(w.Node, w.Bcname))
+	accCol := p.MongoClient.Database.Collection(utils.AccountCol(p.Node, p.Bcname))
 
 	//获取已有数据,缓存起来
 	if counts == nil {
@@ -203,14 +225,13 @@ func (w *WriteDB) SaveCount(block *utils.InternalBlock) error {
 // -----------------------
 // 核心：重点处理交易数据
 // 数据格式问题
-// todo 区分交易类型
 // -----------------------
-func (w *WriteDB) SaveTx(block *utils.InternalBlock) error {
+func (p *Parser) SaveTx(block *utils.InternalBlock) error {
 
 	//索引 最新的交易
 	//global.col.createIndex({"timestamp":-1}, {background: true})
 
-	txCol := w.MongoClient.Database.Collection(utils.TxCol(w.Node, w.Bcname))
+	txCol := p.MongoClient.Database.Collection(utils.TxCol(p.Node, p.Bcname))
 	up := true
 	var err error
 
@@ -233,6 +254,12 @@ func (w *WriteDB) SaveTx(block *utils.InternalBlock) error {
 			tx.Timestamp, _ = strconv.ParseInt(content, 10, 64)
 		}
 
+		// 处理日期格式 --- 方便查询
+		Date := unixToStr(tx.Timestamp, "2006-01-02")
+
+		// 交易费用 --- 方便查询
+		Fee := countTxFee(tx)
+
 		// 交易类型判断
 		if tx.Desc == "1" { //投票奖励
 			status = "vote_reward"
@@ -241,7 +268,6 @@ func (w *WriteDB) SaveTx(block *utils.InternalBlock) error {
 		} else if tx.Desc == "award" { //出块奖励
 			status = "block_reward"
 		}
-
 		// 合约调用判断
 		if len(tx.ContractRequests) >= 1 {
 			status = fmt.Sprintf("%s_contract", tx.ContractRequests[0].ContractName)
@@ -258,7 +284,14 @@ func (w *WriteDB) SaveTx(block *utils.InternalBlock) error {
 				{"_id", string(txid)},
 				{"status", status},
 				{"height", height},
+				// 时间戳
 				{"timestamp", tx.Timestamp},
+				// 日期   ”%s-%s-%s“ 年-月-日  e.g "2022-07-08"
+				{"Date", Date},
+				// tx fee
+				{"Fee", Fee},
+				// 交易发起人
+				{"Initiator", tx.Initiator},
 				{"state", state},
 				{"tx", string(txBytes)},
 			},
@@ -268,7 +301,7 @@ func (w *WriteDB) SaveTx(block *utils.InternalBlock) error {
 }
 
 // 保存区块
-func (w *WriteDB) SaveBlock(block *utils.InternalBlock) error {
+func (p *Parser) SaveBlock(block *utils.InternalBlock) error {
 	// 处理blockeid
 	blockeid, _ := block.Blockid.MarshalJSON()
 
@@ -283,7 +316,22 @@ func (w *WriteDB) SaveBlock(block *utils.InternalBlock) error {
 		{"timestamp", block.Timestamp},
 	}
 
-	blockCol := w.MongoClient.Database.Collection(utils.BlockCol(w.Node, w.Bcname))
+	blockCol := p.MongoClient.Database.Collection(utils.BlockCol(p.Node, p.Bcname))
 	_, err := blockCol.InsertOne(nil, iblock)
 	return err
+}
+
+// 时间戳 转 时间
+func unixToStr(timestamp int64, layout string) string {
+	return time.Unix(timestamp, 0).Format(layout)
+}
+
+// 统计一笔交易的费用
+// input = output
+func countTxFee(tx *utils.Transaction) int64 {
+	fee := big.NewInt(0)
+	for _, input := range tx.TxInputs {
+		fee.Add(fee, (*big.Int)(&input.Amount))
+	}
+	return fee.Int64()
 }

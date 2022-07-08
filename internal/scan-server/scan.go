@@ -2,9 +2,9 @@ package scan_server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/panjf2000/ants/v2"
-	"github.com/xuperchain/xuperchain/service/pb"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -13,7 +13,6 @@ import (
 	chain_server "matrixchaindata/internal/chain-server"
 	"matrixchaindata/pkg/utils"
 	"sync"
-	"time"
 )
 
 var (
@@ -22,46 +21,39 @@ var (
 )
 
 // 扫描器
-type Scaner struct {
-	// 链相关
-	Node        string
-	Bcname      string
-	ChainClient *chain_server.ChainClient // 链客户端
-	// 数据库
-	DBWrite *WriteDB
-	// 监听器用于获取数据
-	Watcher *chain_server.Watcher
-	// 接收数据管道（接受监听数据 + 接受缺少区块的数据 ）
-	LackBlockChan chan *pb.InternalBlock
+type Scanner struct {
+	// 节点
+	Node string
+	// 链名
+	Bcname string
+	// 链客户端
+	ChainClient *chain_server.ChainClient
+	// 区块数据管道
+	BlockChan chan *utils.InternalBlock
+	// 解析器
+	Parser *Parser
 	// 退出方式，使用ctx
 	Cannel context.CancelFunc
+	// 运行状态
+	IsRunning bool
 }
 
 // 创建扫描器
-func NewScanner(node, bcname string) (*Scaner, error) {
+func NewScanner(node, bcname string) (*Scanner, error) {
 	// 创建链客户端连接
 	client, err := chain_server.NewChainClien(node)
 	if err != nil {
 		return nil, fmt.Errorf("creat chain client fail")
 	}
 
-	//数据库处理
-	// 传入的是全局db,不要在这里关闭。应该在mian中处理
-	writeDB := NewWriterDB(global.GloMongodbClient, node, bcname)
+	// 创建解析器
+	parser := NewParser(global.GloMongodbClient, node, bcname)
 
-	// 监听数据
-	watcher, err := client.WatchBlockEvent(bcname)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Scaner{
-		Node:          node,
-		Bcname:        bcname,
-		ChainClient:   client,
-		DBWrite:       writeDB,
-		Watcher:       watcher,
-		LackBlockChan: make(chan *pb.InternalBlock, 100),
+	return &Scanner{
+		Node:        node,
+		Bcname:      bcname,
+		ChainClient: client,
+		Parser:      parser,
 	}, nil
 }
 
@@ -69,19 +61,69 @@ func NewScanner(node, bcname string) (*Scaner, error) {
 // 关闭工作是这样的，连接不为空，则发送退出信号
 // goroutin 接收到信息，则关闭grpc连接，在退出
 // 监听数据很好控制
-func (s *Scaner) Stop() {
-	s.Cannel()
+func (s *Scanner) Stop() {
+	if s.Cannel != nil {
+		s.Cannel()
+	}
 }
 
 // 启动扫描工作
-// 先扫描数据库中缺少的数据
-// 然后再获取监听到的数据
-func (s *Scaner) Start() error {
-	// top goroutin
-	// 第一层ctx, 以context.Background()为boot
-	ctx1, cannel1 := context.WithCancel(context.Background())
-	s.Cannel = cannel1
+func (s *Scanner) Start() error {
+	// 创建一个接收区块的管道
+	receiveBlockChan := make(chan *utils.InternalBlock, 10)
 
+	// ctx
+	ctx, cannel := context.WithCancel(context.Background())
+
+	// 处理订阅的区块
+	err := s.GetBlockFromSubscribe(ctx, receiveBlockChan)
+	if err != nil {
+		return err
+	}
+
+	// 扫描数据库中缺少的区块 or 交易
+	err = s.GetLackBlock(ctx, receiveBlockChan)
+	if err != nil {
+		return err
+	}
+
+	// 启动解析
+	_ = s.Parser.Start(ctx, receiveBlockChan)
+
+	// 设置一下运行状态
+	s.IsRunning = true
+	s.Cannel = cannel
+
+	return nil
+}
+
+// GetBlockFromSubscribe 处理订阅到的区块数据
+func (s *Scanner) GetBlockFromSubscribe(ctx context.Context, blockchan chan<- *utils.InternalBlock) error {
+	//监听数据
+	watcher, err := s.ChainClient.WatchBlockEvent(ctx, s.Bcname)
+	if err != nil {
+		return err
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case block, ok := <-watcher.FilteredBlockChan:
+				if ok {
+					blockchan <- utils.FromInternalBlockPB(block)
+				}
+			}
+		}
+	}()
+	return nil
+}
+
+// GetLackBlock  获取表中缺少的区块数据
+func (s *Scanner) GetLackBlock(ctx context.Context, blockchan chan<- *utils.InternalBlock) error {
+	if blockchan == nil {
+		return errors.New(" blockchan is nil")
+	}
 	go func() {
 		// 这里开启协程池
 		defer ants.Release()
@@ -93,13 +135,13 @@ func (s *Scaner) Start() error {
 					log.Printf("get block by height failed,bcname:%s, height: %d, error: %s", s.Bcname, height, err)
 					return
 				}
-				s.LackBlockChan <- iblock
+				blockchan <- utils.FromInternalBlockPB(iblock)
 			}(i.(int64))
 			wg.Done()
 		})
 		defer p.Release()
 
-		heightChan, err := s.GetLackHeights(ctx1)
+		heightChan, err := s.GetLackHeights(ctx)
 		if err != nil {
 			log.Println("get lack height error", err)
 			return
@@ -110,58 +152,7 @@ func (s *Scaner) Start() error {
 		}
 		log.Println("get blocks finished", s.Node, s.Bcname)
 		wg.Wait()
-		close(s.LackBlockChan)
 		log.Println("quit lack block gortution")
-	}()
-
-	go func() {
-		defer func() {
-			// 监听，如果出现错误关闭管道并退出
-			// 通知监听goroutine退出，随后自己停止
-			s.Watcher.Exit <- struct{}{}
-			// 关闭
-			//s.ChainClient.Close()
-			return
-		}()
-		for {
-			select {
-			case <-ctx1.Done():
-				// 推出管道是在监听退出信号的
-				// 在退出的时候开始清理一些资源
-				log.Println("stop scnner")
-				// 1 通知监听器退出
-				s.Watcher.Exit <- struct{}{}
-				// 2 关闭grpc连接,(需要在里清理，需要关闭监听器之后关闭连接)
-				log.Println("clear network source")
-				_ = s.ChainClient.Close()
-				//s.ChainClient.Close()
-				return
-			case block := <-s.Watcher.FilteredBlockChan:
-				//log.Println("get data from watch chan", s.Bcname)
-				// 处理监听器中数据
-				err := s.DBWrite.Save(utils.FromInternalBlockPB(block), s.Node, s.Bcname)
-				if err != nil {
-					log.Printf("save block to mongodb failed, height: %d, error: %s", block.Height, err)
-				}
-			case lackBlock, ok := <-s.LackBlockChan:
-				//log.Println("get data from lack chan")
-				// 处理缺少区块管道中的数据
-				// 在完成的时候关闭管道
-				// 防止不断读取关闭的管道
-				if ok {
-					err := s.DBWrite.Save(utils.FromInternalBlockPB(lackBlock), s.Node, s.Bcname)
-					if err != nil {
-						log.Printf("save block to mongodb failed, height: %d, error: %s", lackBlock.Height, err)
-					}
-				} else {
-					log.Println("close LackBlockChan")
-					s.LackBlockChan = nil
-				}
-			default:
-				//没有监听到数据睡眠
-				time.Sleep(1 * time.Microsecond)
-			}
-		}
 	}()
 	return nil
 }
@@ -172,7 +163,7 @@ func (s *Scaner) Start() error {
 // 使用context 改进
 // 父gorution可以控制子gorutine结束, 子goroutin可以通知父goroutin完成任务
 // ------------------------------
-func (s *Scaner) GetLackHeights(ctx context.Context) (<-chan int64, error) {
+func (s *Scanner) GetLackHeights(ctx context.Context) (<-chan int64, error) {
 	// 最新的区块高度
 	_, H, err := s.ChainClient.GetUtxoTotalAndTrunkHeight(s.Bcname)
 	if err != nil {
@@ -180,7 +171,7 @@ func (s *Scaner) GetLackHeights(ctx context.Context) (<-chan int64, error) {
 	}
 	log.Println("start get lack blocks", s.Node, s.Bcname)
 	// 获取区块集合
-	blockCol := s.DBWrite.MongoClient.Database.Collection(utils.BlockCol(s.Node, s.Bcname))
+	blockCol := s.Parser.MongoClient.Database.Collection(utils.BlockCol(s.Node, s.Bcname))
 	//获取数据库中最后的区块高度
 	limit := int64(0)
 	var heights []int64
